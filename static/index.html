@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mini AI BI Assistant</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 860px; margin: 30px auto; padding: 0 16px; color: #222; background: #f7f8fa; }
+    h1 { margin-bottom: 4px; }
+    .sub { color: #666; margin-top: 0; }
+    .box { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-top: 16px; }
+    .row { display: flex; gap: 8px; }
+    input { flex: 1; padding: 10px; font-size: 15px; border: 1px solid #bbb; border-radius: 6px; }
+    button { padding: 10px 16px; font-size: 15px; border: 0; border-radius: 6px; background: #2563eb; color: #fff; cursor: pointer; }
+    button:disabled { background: #94a3b8; }
+    .examples button { background: #e5e7eb; color: #222; font-size: 13px; padding: 6px 10px; margin: 4px 4px 0 0; }
+    .answer { font-size: 18px; font-weight: bold; }
+    .error { color: #b91c1c; font-weight: bold; }
+    .warn { color: #92400e; }
+    .meta { color: #555; font-size: 13px; }
+    pre { background: #f1f5f9; padding: 10px; border-radius: 6px; white-space: pre-wrap; font-size: 13px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+    th, td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; font-size: 14px; }
+    th { background: #f1f5f9; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; background: #dbeafe; }
+  </style>
+</head>
+<body>
+  <h1>Mini AI BI Assistant</h1>
+  <p class="sub">Ask a question about the sales data. <span id="llmStatus" class="badge">checking...</span></p>
+
+  <div class="box">
+    <div class="row">
+      <input id="question" placeholder="e.g. What is the total revenue?" maxlength="300">
+      <button id="askBtn" onclick="ask()">Ask</button>
+    </div>
+    <div class="examples">
+      <button onclick="useExample(this)">What is the total revenue?</button>
+      <button onclick="useExample(this)">Which product generated the highest revenue?</button>
+      <button onclick="useExample(this)">What is the monthly revenue trend?</button>
+      <button onclick="useExample(this)">Which region generated the highest sales?</button>
+      <button onclick="useExample(this)">How did revenue change between March and April?</button>
+    </div>
+  </div>
+
+  <div id="result"></div>
+
+  <script>
+    const questionInput = document.getElementById("question");
+    const resultDiv = document.getElementById("result");
+
+    questionInput.addEventListener("keydown", e => { if (e.key === "Enter") ask(); });
+
+    fetch("/api/health").then(r => r.json()).then(d => {
+      document.getElementById("llmStatus").textContent =
+        d.llm_enabled ? "AI mode: Groq LLM + rules" : "AI mode: rules only (no GROQ_API_KEY)";
+    });
+
+    function useExample(btn) {
+      questionInput.value = btn.textContent;
+      ask();
+    }
+
+    // Escape text before putting it into HTML
+    function esc(value) {
+      const div = document.createElement("div");
+      div.textContent = value === null ? "" : String(value);
+      return div.innerHTML;
+    }
+
+    function fmt(value) {
+      return typeof value === "number" ? value.toLocaleString("en-US") : value;
+    }
+
+    async function ask() {
+      const question = questionInput.value;
+      const btn = document.getElementById("askBtn");
+      btn.disabled = true;
+      resultDiv.innerHTML = '<div class="box">Thinking...</div>';
+
+      try {
+        const response = await fetch("/api/ask", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ question: question })
+        });
+        const data = await response.json();
+
+        if (!response.ok) {
+          const msg = typeof data.detail === "string" ? data.detail : "Invalid request";
+          resultDiv.innerHTML = `<div class="box"><div class="error">${esc(msg)}</div></div>`;
+          return;
+        }
+
+        let rowsHtml = data.rows.map(row =>
+          "<tr>" + row.map(v => `<td>${esc(fmt(v))}</td>`).join("") + "</tr>").join("");
+        let warnings = (data.warnings || []).map(w => `<p class="warn">${esc(w)}</p>`).join("");
+
+        resultDiv.innerHTML = `
+          <div class="box">
+            <div class="answer">${esc(data.answer)}</div>
+            ${warnings}
+            <p class="meta">Method: <b>${esc(data.method)}</b>${data.intent ? " (intent: " + esc(data.intent) + ")" : ""}
+              &nbsp;|&nbsp; ${esc(data.explanation)}</p>
+            <h3>Supporting data</h3>
+            <table>
+              <tr>${data.columns.map(c => `<th>${esc(c)}</th>`).join("")}</tr>
+              ${rowsHtml}
+            </table>
+            <h3>SQL used</h3>
+            <pre>${esc(data.sql)}${data.params && data.params.length ? "\n-- params: " + esc(data.params.join(", ")) : ""}</pre>
+          </div>`;
+      } catch (err) {
+        resultDiv.innerHTML = `<div class="box"><div class="error">Could not reach the server: ${esc(err)}</div></div>`;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>
