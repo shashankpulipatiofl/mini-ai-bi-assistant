@@ -14,7 +14,8 @@
 3. **Code generation.** The AI generated a first version of each module. I read every file and kept it simple: standard-library `csv` and `sqlite3`, no ORM, and no framework like LangChain, so every step is visible.
 4. **Design change.** My first version answered the 5 example questions with keyword rules and used the LLM only for other questions. I removed the rules: the task asks for an AI interpretation mechanism, and keyword matching broke on rephrased questions. The app now uses the LLM for every question, with validation guards around it.
 5. **Tests.** The AI suggested test cases. I checked the expected numbers with a separate plain-Python calculation over the CSV, and replaced the LLM with a fake in tests so they are repeatable.
-6. **Docs.** The AI drafted the README. I checked it against the code.
+6. **Router + RAG.** When I tested with a real key, "explain the attributes in the dataset" was refused, because no SQL query can answer it. I added a router step (the LLM classifies the question as data / dataset_info / unsupported) and a small vectorless RAG over a hand-written data dictionary for questions about the dataset.
+7. **Docs.** The AI drafted the README. I checked it against the code.
 
 ## Problems encountered and how I debugged them
 
@@ -30,10 +31,14 @@
 | Tests can't depend on a paid, non-deterministic API | — | pytest `monkeypatch` swaps in a fake LLM, including one that returns `DROP TABLE` and one that makes a SQL typo |
 | The LLM can return broken SQL | — | The SQLite error is sent back to the LLM for one retry (tested with a deliberate typo) |
 | LLMs sometimes wrap JSON in ```json fences | Known LLM behaviour | `parse_json_reply()` strips the fences; tested |
+| "Explain the attributes in the dataset" was refused, even though the answer is known | Manual testing with a real key | Added a router plus RAG over `docs/data_dictionary.md` for questions about the dataset |
+| The first keyword retrieval ranked "Regions and sales channels" above "Revenue definition" for "how is revenue calculated?", because I had mapped "sales" to "revenue" as a synonym | Printed the retrieved section titles for sample questions | Removed that synonym; added a test that checks the top retrieved section |
+| Groq returned 401 Unauthorized | The error message on the page | The `.env` file had a placeholder instead of the real key |
 | My cloud dev environment couldn't reach `api.groq.com` (blocked by a proxy) | Got 403 errors; `curl` showed the proxy refused the connection | Tested the pipeline with the fake LLM; real calls are tested on my own machine |
 
 ## What I would improve with another day
 
+- Switch RAG retrieval to BM25 or embeddings if the documentation grows.
 - Use a real SQL parser (e.g. `sqlglot`) instead of regex for validation.
 - Automatically check that every number in the answer text appears in (or is calculated from) the result rows.
 - An evaluation set of ~30 questions with expected SQL results, to measure real LLM accuracy.

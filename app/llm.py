@@ -1,9 +1,11 @@
 """
 LLM layer: talks to an LLM hosted on Groq (OpenAI-compatible API).
 
-The LLM is used for two jobs:
-  1. generate_sql()  -> turn the user's question into ONE SQLite SELECT query
-  2. write_answer()  -> turn the query RESULT ROWS into a short English answer
+The LLM is used for these jobs:
+  1. route_question() -> decide the question type: data / dataset_info / unsupported
+  2. generate_sql()   -> turn a data question into ONE SQLite SELECT query
+  3. write_answer()   -> turn the query RESULT ROWS into a short English answer
+  (rag.py also uses call_llm() to answer dataset_info questions from the docs)
 
 Important: the LLM never calculates numbers itself. The numbers come from
 running the SQL on the database; the LLM only describes those rows.
@@ -64,6 +66,25 @@ Reply with JSON only: {"answer": "<your answer>"}
 """
 
 
+ROUTER_PROMPT = """You classify questions sent to a business intelligence assistant for a
+sales dataset (office product orders, Jan-Jun 2026: product, category, region, sales channel,
+quantity, unit price, discount, status Completed/Returned, revenue).
+
+Classify the question into exactly one type:
+- "data": needs numbers calculated from the sales records (totals, top/bottom, trends,
+  comparisons, counts, averages, filters). Example: "Which region had the highest sales?"
+- "dataset_info": asks ABOUT the dataset itself: what columns/attributes exist, what a field
+  means, how revenue is defined, business rules, data cleaning, what data is available.
+  Example: "What does the status column mean?"
+- "unsupported": anything else (not about this dataset, needs data that does not exist such as
+  profit or customers, forecasts, requests to change or delete data, chit-chat).
+
+Reply with JSON only: {"type": "data" | "dataset_info" | "unsupported", "reason": "<short reason>"}
+"""
+
+QUESTION_TYPES = {"data", "dataset_info", "unsupported"}
+
+
 class LLMError(Exception):
     """The LLM is not available or returned something unusable."""
 
@@ -112,6 +133,15 @@ def call_llm(system_prompt, user_message):
         raise LLMError(f"LLM request failed: {exc}") from exc
 
     return parse_json_reply(content)
+
+
+def route_question(question):
+    """Decide which kind of question this is. Returns (type, reason)."""
+    data = call_llm(ROUTER_PROMPT, f"Question: {question}")
+    question_type = data.get("type")
+    if question_type not in QUESTION_TYPES:
+        raise LLMError(f"LLM returned an unknown question type: {question_type}")
+    return question_type, data.get("reason", "")
 
 
 def generate_sql(question, previous_sql=None, previous_error=None):

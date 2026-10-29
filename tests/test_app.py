@@ -13,9 +13,11 @@ right numbers. Expected numbers were checked with a separate script on the CSV.
 import pytest
 from fastapi.testclient import TestClient
 
-from app import llm
+from app import llm, rag
 from app.main import app
 from app.sql_validator import UnsafeQueryError, validate_sql
+
+REAL_ROUTE_QUESTION = llm.route_question  # saved before any test replaces it
 
 # SQL a correct LLM would generate for the 5 example questions
 EXAMPLE_SQL = {
@@ -40,6 +42,8 @@ EXAMPLE_SQL = {
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    # Fake router: every question is a "data" question unless a test changes it
+    monkeypatch.setattr(llm, "route_question", lambda q: ("data", "test"))
     # Fake LLM: SQL from the table above; the "answer" just echoes the first row
     monkeypatch.setattr(llm, "generate_sql",
                         lambda q, prev_sql=None, prev_err=None: (EXAMPLE_SQL.get(q), "test"))
@@ -100,9 +104,16 @@ def test_too_long_question_returns_400(client):
     assert ask(client, "revenue " * 100).status_code == 400
 
 
-def test_unrelated_question_returns_422(client):
-    # The fake LLM returns sql=None for unknown questions, like the real prompt asks it to
+def test_unrelated_question_rejected_by_router(client, monkeypatch):
+    monkeypatch.setattr(llm, "route_question", lambda q: ("unsupported", "Not about sales data."))
     r = ask(client, "What is the weather in Hyderabad?")
+    assert r.status_code == 422
+    assert "Not about sales data" in r.json()["detail"]
+
+
+def test_sql_null_from_llm_returns_422(client):
+    # Second guard: even if routed as "data", the SQL step can still say "not answerable"
+    r = ask(client, "What is our profit margin?")      # fake generate_sql returns None
     assert r.status_code == 422
 
 
@@ -202,3 +213,50 @@ def test_answer_llm_failure_still_returns_numbers(client, monkeypatch):
 def test_parse_json_reply_handles_code_fences():
     data = llm.parse_json_reply('```json\n{"sql": "SELECT 1 FROM sales", "explanation": "x"}\n```')
     assert data["sql"] == "SELECT 1 FROM sales"
+
+
+# ---------------------------------------------------------------- dataset questions (RAG)
+
+def test_retrieval_finds_relevant_sections():
+    titles = [s["title"] for s in rag.retrieve("explain the different attributes in the dataset")]
+    assert titles[0] == "Columns and attributes"
+    assert [s["title"] for s in rag.retrieve("what does status mean?")][0] == "Order status"
+    assert rag.retrieve("how is revenue calculated?")[0]["title"] == "Revenue definition and business rules"
+    assert rag.retrieve("what is the weather today") == []          # nothing relevant
+
+
+def test_dataset_question_answered_from_docs(client, monkeypatch):
+    monkeypatch.setattr(llm, "route_question", lambda q: ("dataset_info", "about columns"))
+    seen_prompts = []
+
+    def fake_call_llm(system_prompt, user_message):
+        seen_prompts.append(user_message)
+        return {"answer": "The dataset has 10 columns such as product, region and status."}
+
+    monkeypatch.setattr(llm, "call_llm", fake_call_llm)
+    r = ask(client, "What attributes are in the dataset?")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["question_type"] == "dataset_info"
+    assert body["sql"] is None
+    assert body["rows"][0][0] == "Columns and attributes"           # retrieved section shown
+    assert "transaction_id" in seen_prompts[0]                       # docs were put in the prompt
+
+
+def test_dataset_question_not_in_docs_returns_422(client, monkeypatch):
+    monkeypatch.setattr(llm, "route_question", lambda q: ("dataset_info", ""))
+    r = ask(client, "Who designed the xyzzy logo?")                  # retrieves nothing
+    assert r.status_code == 422
+
+
+def test_llm_says_docs_do_not_contain_answer(client, monkeypatch):
+    monkeypatch.setattr(llm, "route_question", lambda q: ("dataset_info", ""))
+    monkeypatch.setattr(llm, "call_llm", lambda *a: {"answer": None})
+    assert ask(client, "What does the status column mean for customers?").status_code == 422
+
+
+def test_router_bad_reply_returns_503(client, monkeypatch):
+    # Use the REAL route_question, but make the LLM reply with an unknown type
+    monkeypatch.setattr(llm, "route_question", REAL_ROUTE_QUESTION)
+    monkeypatch.setattr(llm, "call_llm", lambda *a: {"type": "banana"})
+    assert ask(client, "What is the total revenue?").status_code == 503
