@@ -6,7 +6,7 @@ Ask questions about sales data in plain English. An LLM first decides what kind 
 - **Questions about the dataset** ("What columns are there?"): answered with **vectorless RAG** over a data dictionary document (`docs/data_dictionary.md`), using only the retrieved sections.
 - **Anything else** is politely refused.
 
-Built for the GET AI-Assisted Development Challenge (target effort 3–4 hours). It is a small working app, not a production system.
+Built for the GET AI-Assisted Development Challenge (target effort 3–4 hours). It is a small working app, not a production system. See [REQUIREMENTS_CHECKLIST.md](REQUIREMENTS_CHECKLIST.md) for where each requirement is met, and [AI_USAGE.md](AI_USAGE.md) for how I used AI.
 
 **Stack:** Python · FastAPI (API) · SQLite (database) · Groq LLM `openai/gpt-oss-120b` (text-to-SQL) · plain HTML/JS (UI) · pytest (tests)
 
@@ -22,13 +22,14 @@ pip install -r requirements.txt
 cp .env.example .env              # then put your key in .env:  GROQ_API_KEY=gsk_...
                                   # free key: https://console.groq.com/keys
 
-uvicorn app.main:app --reload
+python -m uvicorn app.main:app --reload
 ```
 
 Open **http://127.0.0.1:8000** for the UI, or **http://127.0.0.1:8000/docs** for the Swagger API docs.
 
 ```bash
-pytest -v                         # run the tests (no API key needed)
+python -m pytest -v               # run the automated tests (no API key needed)
+python -m scripts.check_examples  # ask the REAL LLM the 5 example questions and check the numbers
 python -m app.database            # load the CSV only; prints loaded/rejected rows
 ```
 
@@ -43,14 +44,14 @@ curl -X POST http://127.0.0.1:8000/api/ask \
 ```json
 {
   "question": "Which region generated the highest sales?",
+  "question_type": "data",
   "answer": "The South region generated the highest sales with 411,200.00, followed by North (384,450.00).",
   "sql": "SELECT region, ROUND(SUM(revenue), 2) AS revenue FROM sales WHERE status = 'Completed' GROUP BY region ORDER BY revenue DESC",
   "explanation": "Total completed revenue per region, highest first.",
   "columns": ["region", "revenue"],
   "rows": [["South", 411200.0], ["North", 384450.0], ["East", 346700.0], ["West", 296850.0]],
   "row_count": 4,
-  "attempts": 1,
-  "question_type": "data"
+  "attempts": 1
 }
 ```
 
@@ -71,7 +72,7 @@ For a dataset question such as `"What columns are in the dataset?"`, the respons
 | 400 | Empty question, or longer than 300 characters |
 | 422 | Request body is malformed, the question can't be answered from the data or the docs, or the generated SQL was blocked or failed twice |
 | 404 | The query was valid but found no matching data (e.g. a month that isn't in the dataset) |
-| 503 | The LLM is unavailable (no API key, network error, bad reply) |
+| 503 | The LLM is unavailable (no API key, wrong key, rate limit, network error, bad reply) |
 
 ---
 
@@ -119,6 +120,7 @@ For a dataset question such as `"What columns are in the dataset?"`, the respons
 | `docs/data_dictionary.md` | Knowledge document for questions about the dataset |
 | `static/index.html` | One-page UI |
 | `tests/test_app.py` | Automated tests (the LLM is replaced by a fake) |
+| `scripts/check_examples.py` | Manual check of the real LLM on the 5 example questions |
 
 ---
 
@@ -176,13 +178,13 @@ The LLM (Groq, `openai/gpt-oss-120b`, `temperature=0`, JSON mode) is used in sma
 
 ## 5. Testing
 
-`pytest -v` runs **33 tests**. The LLM is replaced by a fake with pytest `monkeypatch`, so the tests need no key or internet and always give the same result. The fake returns what a correct LLM would return. The tests check that the app routes, validates, runs and answers correctly using the real database and the real docs.
+`python -m pytest -v` runs **34 tests**. The LLM is replaced by a fake with pytest `monkeypatch`, so the tests need no key or internet and always give the same result. The fake returns what a correct LLM would return. The tests check that the app routes, validates, runs and answers correctly using the real database and the real docs.
 
 | Type | Tests |
 |---|---|
 | Valid data questions (all 5 examples) | total revenue = 1,439,200 · top product = Monitor · 6-month trend · top region = South · March vs April rows |
 | Dataset questions (RAG) | retrieval picks "Columns and attributes" for an attributes question and "Order status" for a status question · answer comes back with the retrieved sections and no SQL · the docs really are put into the prompt · a question with nothing relevant in the docs → 422 · the LLM saying "not in docs" → 422 |
-| Invalid questions | empty (400) · missing field (422) · too long (400) · router says unsupported (422) · SQL step says not answerable (422) · no API key (503) · router returns an unknown type (503) |
+| Invalid questions | empty (400) · missing field (422) · too long (400) · router says unsupported (422) · SQL step says not answerable (422) · no API key (503) · wrong API key gives a clear message (503) · router returns an unknown type (503) |
 | SQL safety | the LLM returning `DROP TABLE` is blocked and the data stays intact · 8 unsafe queries rejected by the validator · a normal SELECT allowed |
 | Edge cases | bad CSV rows rejected · returned orders excluded · month with no data (404) · the LLM fixes its own SQL error on retry · gives up after 2 bad queries · answer-writing failure still returns the numbers · JSON in ``` fences parsed |
 
@@ -199,7 +201,7 @@ The LLM (Groq, `openai/gpt-oss-120b`, `temperature=0`, JSON mode) is used in sma
 - **The answer text comes from an LLM.** It is told to use only the result rows, but this isn't checked automatically. The supporting table is the source of truth.
 - **Answer wording can vary slightly between runs**, even at temperature 0.
 - **The validator uses regex, not a real SQL parser.** It also blocks the harmless SQLite `REPLACE()` function.
-- **The tests use a fake LLM**, so they test the pipeline and its guards, not the quality of the real model's SQL.
+- **The tests use a fake LLM**, so they test the pipeline and its guards, not the quality of the real model's SQL. `scripts/check_examples.py` covers the real model, but only for the 5 example questions.
 - **Rejected rows are excluded.** TXN0051's price could be filled in (Laptop Stand is always 1,200), but I chose not to guess financial data.
 - **Months without a year are assumed to be 2026** (the only year in the data).
 - No authentication, no conversation memory, no charts. The database is rebuilt on every start.
@@ -207,4 +209,5 @@ The LLM (Groq, `openai/gpt-oss-120b`, `temperature=0`, JSON mode) is used in sma
 ## 7. What works / what doesn't
 
 - **Works:** all 5 example questions, free-form data questions (e.g. "revenue by sales channel", "top product in the North region"), questions about the dataset via RAG (e.g. "what columns are there?", "how is revenue calculated?"), plus the safety checks, error handling and automated tests.
-- **Real Groq calls:** the automated tests use a fake LLM. The real LLM path was checked manually on my machine with a Groq key.
+- **Real Groq calls:** the automated tests use a fake LLM. I checked the real model on my own machine with `python -m scripts.check_examples` and by asking questions in the UI.
+- **Doesn't work:** questions that need data the CSV doesn't have (profit, customers, anything after June 2026). Those are refused on purpose.

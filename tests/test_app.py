@@ -10,6 +10,7 @@ the app validates it, runs it on the real SQLite database, and returns the
 right numbers. Expected numbers were checked with a separate script on the CSV.
 """
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -260,3 +261,14 @@ def test_router_bad_reply_returns_503(client, monkeypatch):
     monkeypatch.setattr(llm, "route_question", REAL_ROUTE_QUESTION)
     monkeypatch.setattr(llm, "call_llm", lambda *a: {"type": "banana"})
     assert ask(client, "What is the total revenue?").status_code == 503
+
+
+def test_wrong_api_key_gives_clear_message(monkeypatch):
+    # Simulate Groq answering 401 Unauthorized (wrong / revoked key)
+    monkeypatch.setenv("GROQ_API_KEY", "wrong-key")
+    fake_response = httpx.Response(401, request=httpx.Request("POST", llm.GROQ_URL))
+    monkeypatch.setattr(llm.httpx, "post", lambda *a, **k: fake_response)
+    with TestClient(app) as c:
+        r = ask(c, "What is the total revenue?")
+    assert r.status_code == 503
+    assert "rejected the API key" in r.json()["detail"]

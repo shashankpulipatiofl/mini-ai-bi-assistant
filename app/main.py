@@ -7,7 +7,7 @@ Endpoints:
   POST /api/ask        -> {"question": "..."}  ->  structured answer
   GET  /api/data-quality -> rows rejected while loading the CSV
 
-Run:  uvicorn app.main:app --reload
+Run:  python -m uvicorn app.main:app --reload
 """
 
 import logging

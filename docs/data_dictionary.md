@@ -20,7 +20,7 @@ The dataset has 10 original columns (attributes / fields) plus 2 derived columns
 - product: the product that was sold.
 - category: the product category (Accessories, Furniture, Electronics).
 - region: the sales region (North, South, East, West).
-- sales_channel: how the product was sold, Online or Retail (in a physical store).
+- sales_channel: how the product was sold, Online or Retail.
 - quantity: number of units sold in the transaction.
 - unit_price: price of one unit.
 - discount_amount: total discount given on the transaction (an amount, not a percentage).
@@ -43,7 +43,7 @@ Monitor 9500.
 ## Regions and sales channels
 
 Regions: North, South, East and West.
-Sales channels: Online (e-commerce orders) and Retail (store sales).
+Sales channels: Online and Retail.
 
 ## Revenue definition and business rules
 
@@ -54,8 +54,8 @@ figures. "Sales" in questions means revenue.
 
 ## Order status
 
-Completed means the order was delivered and paid. Returned means the customer
-sent the product back, so it does not count as revenue. In the cleaned data
+Completed means a finished sale, which counts as revenue. Returned means the
+product was sent back, so the transaction does not count as revenue. In the cleaned data
 there are 48 Completed orders and 1 Returned order (TXN0033).
 
 ## Data quality and cleaning

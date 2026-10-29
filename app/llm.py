@@ -41,7 +41,8 @@ Columns:
 
 Rules:
 - "Revenue" or "sales" means SUM(revenue) and MUST include WHERE status = 'Completed'.
-- Use only the sales table. Write exactly ONE SELECT statement. No comments.
+- Use only the sales table. Write exactly ONE statement that starts with SELECT.
+  Do not use WITH (CTEs) and do not use SQL comments. Sub-queries are allowed.
 - Round money values with ROUND(x, 2) and give every column a clear alias.
 - For "highest" / "top" / "best" questions, return ALL groups ordered DESC (not LIMIT 1),
   so the user can see the supporting figures.
@@ -127,6 +128,15 @@ def call_llm(system_prompt, user_message):
             json=payload,
             timeout=30,
         )
+    except httpx.HTTPError as exc:
+        raise LLMError(f"Could not reach the LLM service: {exc}") from exc
+
+    if response.status_code == 401:
+        raise LLMError("Groq rejected the API key (401). Check GROQ_API_KEY in .env "
+                       "and restart the server.")
+    if response.status_code == 429:
+        raise LLMError("Groq rate limit reached (429). Wait a minute and try again.")
+    try:
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
     except (httpx.HTTPError, KeyError, IndexError, ValueError) as exc:
