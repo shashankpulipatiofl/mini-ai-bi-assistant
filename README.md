@@ -8,7 +8,29 @@ Ask questions about sales data in plain English. An LLM first decides what kind 
 
 Built for the GET AI-Assisted Development Challenge (target effort 3–4 hours). It is a small working app, not a production system. See [REQUIREMENTS_CHECKLIST.md](REQUIREMENTS_CHECKLIST.md) for where each requirement is met, and [AI_USAGE.md](AI_USAGE.md) for how I used AI.
 
-**Stack:** Python · FastAPI (API) · SQLite (database) · Groq LLM `openai/gpt-oss-120b` (text-to-SQL) · plain HTML/JS (UI) · pytest (tests)
+**Stack:** Python 3.10+ · FastAPI (API) · SQLite (database) · Groq LLM `openai/gpt-oss-120b` · plain HTML/JS (UI) · pytest (tests)
+
+## Project structure
+
+```
+ai-bi-assistant/
+├── app/
+│   ├── main.py             FastAPI app and endpoints
+│   ├── qa_service.py       question pipeline (router → SQL or RAG → answer)
+│   ├── llm.py              Groq API calls and prompts
+│   ├── rag.py              vectorless RAG over the data dictionary
+│   ├── sql_validator.py    safety checks for generated SQL
+│   └── database.py         CSV cleaning, SQLite loading, read-only queries
+├── data/sales_data.csv     supplied dataset
+├── docs/data_dictionary.md knowledge document for dataset questions
+├── static/index.html       web UI
+├── tests/test_app.py       automated tests
+├── scripts/check_examples.py  checks the real LLM on the 5 example questions
+├── AI_USAGE.md             AI tools used, problems, debugging, improvements
+├── REQUIREMENTS_CHECKLIST.md  challenge requirements mapped to the code
+├── requirements.txt
+└── .env.example            template for the Groq API key
+```
 
 ---
 
