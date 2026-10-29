@@ -1,45 +1,34 @@
 # Mini AI Business Intelligence Assistant
 
-Ask questions about sales data in plain English and get answers backed by real SQL queries.
+Ask questions about sales data in plain English. An LLM turns each question into SQL, the SQL is validated and run on a SQLite database, and the API returns a structured answer with the supporting figures.
 
 Built for the GET AI-Assisted Development Challenge (target effort 3–4 hours). It is a small working app, not a production system.
 
-**Stack:** Python · FastAPI (API) · SQLite (database) · Groq LLM (text-to-SQL) · plain HTML/JS (UI) · pytest (tests)
+**Stack:** Python · FastAPI (API) · SQLite (database) · Groq LLM `openai/gpt-oss-120b` (text-to-SQL) · plain HTML/JS (UI) · pytest (tests)
 
 ---
 
 ## 1. Setup and run
 
 ```bash
-# 1. Create a virtual environment (optional but recommended)
 python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
-
-# 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. (Optional) add an LLM key – without it the app runs in "rules only" mode
-cp .env.example .env              # then paste your key from https://console.groq.com/keys
+cp .env.example .env              # then put your key in .env:  GROQ_API_KEY=gsk_...
+                                  # free key: https://console.groq.com/keys
 
-# 4. Start the server
 uvicorn app.main:app --reload
 ```
 
-Open **http://127.0.0.1:8000** for the UI, or **http://127.0.0.1:8000/docs** for the auto-generated API docs (Swagger).
-
-Run the tests:
+Open **http://127.0.0.1:8000** for the UI, or **http://127.0.0.1:8000/docs** for the Swagger API docs.
 
 ```bash
-pytest -v
+pytest -v                         # run the tests (no API key needed)
+python -m app.database            # load the CSV only; prints loaded/rejected rows
 ```
 
-Load the CSV only (prints loaded and rejected rows):
-
-```bash
-python -m app.database
-```
-
-### Example API call
+### Example
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/ask \
@@ -47,142 +36,148 @@ curl -X POST http://127.0.0.1:8000/api/ask \
      -d '{"question": "Which region generated the highest sales?"}'
 ```
 
-Response (shortened):
-
 ```json
 {
   "question": "Which region generated the highest sales?",
-  "method": "rule_based",
-  "intent": "top_region",
-  "answer": "The South region generated the highest sales: 411,200.00 from 13 orders.",
-  "sql": "SELECT region, ROUND(SUM(revenue), 2) AS revenue, COUNT(*) AS orders FROM sales WHERE status = 'Completed' GROUP BY region ORDER BY revenue DESC",
-  "explanation": "Revenue per region for completed orders, sorted highest first.",
-  "columns": ["region", "revenue", "orders"],
-  "rows": [["South", 411200.0, 13], ["North", 384450.0, 14], ["East", 346700.0, 10], ["West", 296850.0, 11]],
-  "warnings": []
+  "answer": "The South region generated the highest sales with 411,200.00, followed by North (384,450.00).",
+  "sql": "SELECT region, ROUND(SUM(revenue), 2) AS revenue FROM sales WHERE status = 'Completed' GROUP BY region ORDER BY revenue DESC",
+  "explanation": "Total completed revenue per region, highest first.",
+  "columns": ["region", "revenue"],
+  "rows": [["South", 411200.0], ["North", 384450.0], ["East", 346700.0], ["West", 296850.0]],
+  "row_count": 4,
+  "attempts": 1
 }
 ```
+
+(The `answer` and `explanation` wording comes from the LLM, so it can vary a little. The numbers come from the database.)
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /` | Web UI |
 | `POST /api/ask` | Body `{"question": "..."}` → structured answer |
-| `GET /api/health` | Status, and whether the LLM is configured |
-| `GET /api/data-quality` | Rows rejected during CSV loading, with the reason |
+| `GET /api/health` | Status, and whether an LLM key is configured |
+| `GET /api/data-quality` | Rows rejected while loading the CSV, with the reason |
 
-Error codes: `400` empty or too-long question · `422` question can't be answered from this data (or the request body is malformed) · `404` question understood but no matching data (e.g. a month that isn't in the dataset) · `500` database error.
+| HTTP code | When |
+|---|---|
+| 200 | Answer returned |
+| 400 | Empty question, or longer than 300 characters |
+| 422 | Request body is malformed, the question can't be answered from the data, or the generated SQL was blocked or failed twice |
+| 404 | The query was valid but found no matching data (e.g. a month that isn't in the dataset) |
+| 503 | The LLM is unavailable (no API key, network error, bad reply) |
 
 ---
 
 ## 2. Architecture
 
 ```
- ┌──────────────┐   POST /api/ask    ┌────────────────────────────────────────────┐
- │  Browser UI  │ ─────────────────▶ │  FastAPI  (app/main.py)                    │
- │ static/index │ ◀───────────────── │   maps errors to HTTP status codes         │
- └──────────────┘   JSON answer      └───────────────────┬────────────────────────┘
-                                                         ▼
-                                     ┌────────────────────────────────────────────┐
-                                     │  QA pipeline  (app/qa_service.py)          │
-                                     │  1. check input                            │
-                                     │  2. ROUTER: known question type?           │
-                                     │       yes ─▶ rule_based.py (fixed SQL)     │
-                                     │       no  ─▶ llm.py (Groq writes SQL)      │
-                                     │              └▶ sql_validator.py           │
-                                     │              (unsafe/failed ─▶ rules)      │
-                                     │  3. run SQL  4. build answer from rows     │
-                                     └───────────────────┬────────────────────────┘
-                                                         ▼
-                                     ┌────────────────────────────────────────────┐
-                                     │  SQLite  (app/database.py, data/sales.db)  │
-                                     │  tables: sales, rejected_records           │
-                                     │  queries use a READ-ONLY connection        │
-                                     └────────────────────────────────────────────┘
+ Browser (static/index.html)
+        │  POST /api/ask {"question": "..."}
+        ▼
+ FastAPI (app/main.py) ── turns errors into HTTP status codes
+        │
+        ▼
+ qa_service.answer_question()  (app/qa_service.py)
+   1. check input ─────────────────────────────────────▶ 400
+   2. llm.generate_sql()   question ──▶ Groq LLM ──▶ {"sql", "explanation"}
+         sql = null ───────────────────────────────────▶ 422 (unsupported)
+   3. sql_validator.validate_sql()   SELECT only, sales table only
+         unsafe ───────────────────────────────────────▶ 422 (blocked)
+   4. database.run_query()   SQLite, READ-ONLY connection
+         SQL error ──▶ send error back to LLM, retry once (self-correction)
+   5. no rows ─────────────────────────────────────────▶ 404
+   6. llm.write_answer()   result rows ──▶ Groq LLM ──▶ {"answer"}
+   7. return {answer, sql, explanation, columns, rows, row_count, attempts}
+        │
+        ▼
+ SQLite  data/sales.db   tables: sales, rejected_records
 ```
 
 | File | Responsibility |
 |---|---|
 | `app/database.py` | Load and clean the CSV into SQLite; run read-only queries |
-| `app/rule_based.py` | Keyword intent detection plus fixed SQL for the 5 example questions |
-| `app/llm.py` | Groq API call: question → `{"sql", "explanation"}` JSON |
-| `app/sql_validator.py` | Checks that SQL is safe before it runs |
-| `app/qa_service.py` | Pipeline / router that ties everything together and writes the answer text |
+| `app/llm.py` | Groq API calls: question → SQL, and result rows → answer text |
+| `app/sql_validator.py` | Checks that a generated SQL query is safe before it runs |
+| `app/qa_service.py` | The pipeline above (steps 1–7) |
 | `app/main.py` | FastAPI endpoints and error handling |
 | `static/index.html` | One-page UI |
-| `tests/test_app.py` | Automated tests |
+| `tests/test_app.py` | Automated tests (the LLM is replaced by a fake) |
 
 ---
 
 ## 3. Data management
 
-**How the data is stored.** On startup the CSV is read row by row with Python's `csv` module, validated, and inserted into SQLite (`data/sales.db`). The database is rebuilt from the CSV on every start, so the CSV stays the single source of truth.
+**How the data is stored.** On startup the CSV is read row by row (Python `csv` module), validated, and inserted into SQLite (`data/sales.db`). The database is rebuilt from the CSV on every start, so the CSV stays the single source of truth.
 
 - `sales` holds the valid rows, with proper types. Dates are converted from `DD-MM-YYYY` to ISO `YYYY-MM-DD`. Two derived columns are added:
-  - `order_month` (`YYYY-MM`), which makes monthly grouping simple.
-  - `revenue = quantity × unit_price − discount_amount`, computed once, so every query uses the same formula.
-- `rejected_records` holds invalid rows plus the reason. They are kept for auditing, not silently dropped.
+  - `order_month` (`YYYY-MM`), which makes monthly questions easy for the LLM.
+  - `revenue = quantity × unit_price − discount_amount`, computed once, so the LLM never has to re-derive the formula.
+- `rejected_records` holds invalid rows plus the reason, kept for auditing (visible at `/api/data-quality`).
 
-**Business rule:** revenue counts only `status = 'Completed'` orders. Returned orders are valid records, so they stay in `sales`, but every revenue query filters them out.
+**Business rule:** revenue counts only `status = 'Completed'` orders. The returned order stays in `sales` but is filtered out. This rule is written into the LLM prompt.
 
-**Validation rules (per row):** required fields present · date parses as `DD-MM-YYYY` · quantity is an integer > 0 · unit price is a number > 0 · discount ≥ 0 and not larger than the order value · status is `Completed` or `Returned` · no duplicate transaction IDs.
-
-**What happened with the supplied CSV (51 rows):**
+**Validation per row:** required fields present · valid `DD-MM-YYYY` date · quantity is an integer > 0 · unit price > 0 · 0 ≤ discount ≤ order value · status is `Completed` or `Returned` · no duplicate IDs.
 
 | Row | Problem | Handling |
 |---|---|---|
-| TXN0034 | Quantity = 0 | Rejected (an order of 0 units isn't a real sale) |
-| TXN0051 | Unit price missing | Rejected. I did not guess the price; see Limitations |
+| TXN0034 | Quantity = 0 | Rejected |
+| TXN0051 | Unit price missing | Rejected (I didn't guess a price) |
 | TXN0033 | Status = Returned | Kept, but excluded from revenue |
 
-Result: 49 rows loaded, 48 of them Completed. Total revenue = **1,439,200.00**. I checked this against an independent plain-Python calculation over the CSV.
+Result: 49 rows loaded, 48 Completed. Total revenue = **1,439,200.00**. I checked this against a separate plain-Python calculation over the CSV.
 
-**How it is queried.** Every answer comes from a SQL `SELECT` on the `sales` table. The SQL is returned in the response and shown in the UI, so the user can see exactly how each number was calculated.
+**How it is queried.** Every answer comes from a `SELECT` query on the `sales` table. The query is written by the LLM and returned in the response, so the user can see how each number was calculated.
 
 ---
 
 ## 4. AI integration and how wrong answers are prevented
 
-**Approach: hybrid router (rules first for known questions, LLM for everything else).**
+The LLM (Groq, `openai/gpt-oss-120b`, `temperature=0`, JSON mode) is called twice per question:
 
-1. **Rule-based path (deterministic).** `detect_intent()` uses keywords to recognise the 5 example question types (total revenue, top product, monthly trend, top region, month-to-month change). Each type has a hand-written, tested SQL query. If the question contains a filter the fixed query can't apply (a region name, a product, a channel, a month…), the rule refuses to match. It doesn't return an answer to a slightly different question.
-2. **LLM path (text-to-SQL).** Any other question (e.g. *"revenue by sales channel"*, *"top product in the North region"*) goes to an LLM on Groq (default `openai/gpt-oss-120b`). The prompt contains the table schema, the revenue rule, and an instruction to return `{"sql": null}` when the question can't be answered from this table. `temperature=0` and JSON mode make the output more predictable.
+1. **Text-to-SQL.** The prompt contains the table schema, sample values, the revenue rule (`status = 'Completed'`), output rules (one SELECT, round money, show all groups for "highest" questions), and an instruction to return `"sql": null` for questions the data can't answer.
+2. **Answer writing.** The LLM gets the question and the query result rows, and writes a 1–3 sentence answer using *only* those numbers.
 
-**Safety and correctness guards:**
+**Guards:**
 
-- **The LLM never produces numbers.** It only writes SQL. All figures come from running that SQL on the database, and the answer text is built in Python from the result rows.
-- **The SQL is validated before it runs** (`sql_validator.py`): one statement only, must start with `SELECT`, no `DROP/DELETE/UPDATE/INSERT/ALTER/CREATE/PRAGMA/ATTACH…`, no SQL comments, and the only table allowed is `sales`.
-- **The database connection is read-only** (`mode=ro`). Even if a bad query got past the validator, SQLite would refuse to write. That's two layers of protection.
-- **Fallbacks:** no API key, network error, invalid JSON, unsafe SQL, or a SQL syntax error all fall back to the rule-based path. If the rules don't understand the question either, the user gets a clear "can't answer" message (HTTP 422) instead of a guess.
-- **Transparency:** every response includes the method used, the SQL, an explanation, and the supporting rows.
-- Results are capped at 200 rows, and questions at 300 characters.
+| Risk | Guard |
+|---|---|
+| Destructive SQL (`DROP`, `DELETE`…) | `sql_validator.py`: single statement, must start with `SELECT`, no write/admin keywords, no comments, only the `sales` table. Unsafe SQL is **never** executed. |
+| Validator misses something | The SQLite connection is opened **read-only** (`mode=ro`), so the database itself refuses writes |
+| Question not about this data | The prompt tells the LLM to return `sql: null` → 422 "can't be answered" instead of a made-up answer |
+| LLM writes broken SQL | The SQLite error is sent back to the LLM for **one** retry; if it still fails → 422 |
+| LLM invents numbers | The numbers come from SQL results. The answer prompt says to use only the given rows, and the rows are always shown next to the answer. |
+| Wrong logic hidden from the user | The SQL and an explanation are returned with every answer, so they can be checked |
+| Answer-writing call fails | The numbers are still correct, so a plain "N rows returned" answer is used instead of an error |
+| Huge results | Results are capped at 200 rows; questions at 300 characters |
 
 ---
 
 ## 5. Testing
 
-`pytest -v` runs **26 tests** (19 test functions; one is parametrised over 8 unsafe queries). No API key or internet connection is needed, because the LLM is switched off or replaced with a fake.
+`pytest -v` runs **27 tests**. The LLM is replaced by a fake with pytest `monkeypatch`, so the tests need no key or internet and always give the same result. The fake returns the SQL a correct LLM would write. The tests check that the app validates it, runs it on the real database, and returns the correct numbers.
 
 | Type | Tests |
 |---|---|
-| Valid questions | total revenue, top product, monthly trend, top region, March vs April change (with exact expected numbers) |
-| Invalid questions | empty question (400), missing field (422), too-long question (400), unrelated question (422), filtered question the rules must not answer (422) |
-| Edge cases | bad CSV rows rejected on load, a month with no data (July → 404), month parsing (`"March 2026"`, `"apr"`, `"2026-05"`, "May I know…") |
-| SQL safety | DROP, DELETE, UPDATE, stacked statements, other tables, `sqlite_master`, comments, empty query are all blocked; a normal SELECT is allowed |
-| LLM path (fake LLM) | generated SELECT is executed · generated `DROP TABLE` is blocked and the data stays intact · the LLM saying "unsupported" → 422 · JSON wrapped in ``` fences is parsed |
+| Valid questions (all 5 examples) | total revenue = 1,439,200 · top product = Monitor · 6-month trend · top region = South · March vs April rows |
+| Invalid questions | empty (400) · missing field (422) · too long (400) · unrelated question, where the LLM returns null (422) · no API key (503) |
+| SQL safety | the LLM returning `DROP TABLE` is blocked and the data stays intact · 8 unsafe queries rejected by the validator · a normal SELECT allowed |
+| Edge cases | bad CSV rows rejected · returned orders excluded · month with no data (404) · the LLM fixes its own SQL error on retry · gives up after 2 bad queries · answer-writing failure still returns the numbers · JSON wrapped in ``` fences is parsed |
 
 ---
 
 ## 6. Known limitations
 
-- **Rules only understand the 5 question shapes.** Without an API key, other questions get a polite "unsupported" response.
-- **Keyword matching is simple.** Unusual wording (e.g. "Which SKU brought in the most money?") may not match a rule. With a key, those questions go to the LLM instead.
-- **LLM answers use a generic text format** ("N rows returned. First row: …"). The table shows all the figures, but the sentence is less natural than the rule-based answers.
-- **The LLM can still write a query that is valid but logically wrong** (e.g. it forgets the `Completed` filter). The validator checks safety, not business logic. The SQL is shown so the user can check it.
-- **The validator is keyword/regex based, not a real SQL parser.** It also blocks the harmless SQLite `REPLACE()` string function.
-- **Rejected rows are excluded.** TXN0051's price could arguably be filled in from other Laptop Stand rows (1,200), but I chose not to guess financial data.
-- **Single year assumed.** A month without a year ("March") is treated as 2026, because that is the only year in the data.
+- **Needs an API key and internet.** Without a key, `/api/ask` returns 503.
+- **The LLM can write SQL that is safe but logically wrong** (e.g. it forgets the `Completed` filter). The validator checks safety, not business meaning. The SQL is shown so a user can check it.
+- **The answer text comes from an LLM.** It is told to use only the result rows, but this isn't checked automatically. The supporting table is the source of truth.
+- **Answer wording can vary slightly between runs**, even at temperature 0.
+- **The validator uses regex, not a real SQL parser.** It also blocks the harmless SQLite `REPLACE()` function.
+- **The tests use a fake LLM**, so they test the pipeline and its guards, not the quality of the real model's SQL.
+- **Rejected rows are excluded.** TXN0051's price could be filled in (Laptop Stand is always 1,200), but I chose not to guess financial data.
+- **Months without a year are assumed to be 2026** (the only year in the data).
 - No authentication, no conversation memory, no charts. The database is rebuilt on every start.
 
 ## 7. What works / what doesn't
 
-All 5 example questions work, in both rules-only mode and LLM mode. The LLM path has been tested with a mocked LLM. A real Groq call needs your own `GROQ_API_KEY`.
+- **Works:** all 5 example questions and free-form questions about the table (e.g. "revenue by sales channel", "top product in the North region"), plus the safety checks, error handling and automated tests.
+- **Not tested here:** the real Groq call. My development environment couldn't reach `api.groq.com`, so the LLM path is tested with a fake LLM. Run it locally with your own key.

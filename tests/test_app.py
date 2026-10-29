@@ -1,9 +1,13 @@
 """
 Automated tests. Run with:  pytest -v
 
-The LLM is switched OFF (or replaced by a fake) in every test, so the tests
-are fast, free, and do not depend on the internet.
-Expected numbers were checked by hand / with a separate script against the CSV.
+The real LLM is replaced by a FAKE in these tests (pytest monkeypatch), so they:
+  * run without an API key or internet,
+  * are free and fast,
+  * always give the same result.
+The fake returns the SQL a correct LLM would write; the tests then check that
+the app validates it, runs it on the real SQLite database, and returns the
+right numbers. Expected numbers were checked with a separate script on the CSV.
 """
 
 import pytest
@@ -11,13 +15,36 @@ from fastapi.testclient import TestClient
 
 from app import llm
 from app.main import app
-from app.rule_based import detect_intent, extract_months
 from app.sql_validator import UnsafeQueryError, validate_sql
+
+# SQL a correct LLM would generate for the 5 example questions
+EXAMPLE_SQL = {
+    "What is the total revenue?":
+        "SELECT ROUND(SUM(revenue), 2) AS total_revenue FROM sales WHERE status = 'Completed'",
+    "Which product generated the highest revenue?":
+        "SELECT product, ROUND(SUM(revenue), 2) AS revenue FROM sales "
+        "WHERE status = 'Completed' GROUP BY product ORDER BY revenue DESC",
+    "What is the monthly revenue trend?":
+        "SELECT order_month AS month, ROUND(SUM(revenue), 2) AS revenue FROM sales "
+        "WHERE status = 'Completed' GROUP BY order_month ORDER BY order_month",
+    "Which region generated the highest sales?":
+        "SELECT region, ROUND(SUM(revenue), 2) AS revenue FROM sales "
+        "WHERE status = 'Completed' GROUP BY region ORDER BY revenue DESC",
+    "How did revenue change between March and April?":
+        "SELECT order_month AS month, ROUND(SUM(revenue), 2) AS revenue FROM sales "
+        "WHERE status = 'Completed' AND order_month IN ('2026-03', '2026-04') "
+        "GROUP BY order_month ORDER BY order_month",
+}
 
 
 @pytest.fixture
 def client(monkeypatch):
-    monkeypatch.delenv("GROQ_API_KEY", raising=False)  # rules-only mode
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    # Fake LLM: SQL from the table above; the "answer" just echoes the first row
+    monkeypatch.setattr(llm, "generate_sql",
+                        lambda q, prev_sql=None, prev_err=None: (EXAMPLE_SQL.get(q), "test"))
+    monkeypatch.setattr(llm, "write_answer",
+                        lambda q, cols, rows: f"Answer based on {rows[0]}")
     with TestClient(app) as c:  # "with" runs startup -> loads CSV into SQLite
         yield c
 
@@ -32,41 +59,31 @@ def test_total_revenue(client):
     r = ask(client, "What is the total revenue?")
     assert r.status_code == 200
     body = r.json()
-    assert body["rows"][0][0] == 1439200.0          # total revenue
-    assert body["rows"][0][1] == 48                 # completed orders
-    assert "1,439,200.00" in body["answer"]
-    assert "status = 'Completed'" in body["sql"]   # returned orders excluded
+    assert body["rows"] == [[1439200.0]]
+    assert body["answer"]                                   # answer text present
+    assert set(body) >= {"answer", "sql", "columns", "rows", "explanation"}
 
 
 def test_top_product(client):
-    r = ask(client, "Which product generated the highest revenue?")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["rows"][0][0] == "Monitor"
-    assert body["rows"][0][1] == 473000.0
-    assert len(body["rows"]) == 7                   # all products shown as supporting data
+    body = ask(client, "Which product generated the highest revenue?").json()
+    assert body["rows"][0] == ["Monitor", 473000.0]
+    assert body["row_count"] == 7                           # all products = supporting data
 
 
 def test_monthly_trend(client):
-    r = ask(client, "What is the monthly revenue trend?")
-    assert r.status_code == 200
-    months = [row[0] for row in r.json()["rows"]]
-    assert months == ["2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06"]
+    body = ask(client, "What is the monthly revenue trend?").json()
+    assert [row[0] for row in body["rows"]] == [
+        "2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06"]
 
 
 def test_top_region(client):
-    r = ask(client, "Which region generated the highest sales?")
-    assert r.status_code == 200
-    assert r.json()["rows"][0][:2] == ["South", 411200.0]
+    body = ask(client, "Which region generated the highest sales?").json()
+    assert body["rows"][0] == ["South", 411200.0]
 
 
 def test_month_comparison(client):
-    r = ask(client, "How did revenue change between March and April?")
-    assert r.status_code == 200
-    body = r.json()
-    assert "increased" in body["answer"]
-    assert "16,800.00" in body["answer"]             # 240,700 - 223,900
-    assert body["params"] == ["2026-03", "2026-04"]
+    body = ask(client, "How did revenue change between March and April?").json()
+    assert body["rows"] == [["2026-03", 223900.0], ["2026-04", 240700.0]]
 
 
 # ---------------------------------------------------------------- invalid questions
@@ -84,39 +101,31 @@ def test_too_long_question_returns_400(client):
 
 
 def test_unrelated_question_returns_422(client):
+    # The fake LLM returns sql=None for unknown questions, like the real prompt asks it to
     r = ask(client, "What is the weather in Hyderabad?")
     assert r.status_code == 422
 
 
-def test_filtered_question_not_answered_by_rules(client):
-    # Rules can't filter by region, so they must NOT return the overall top product.
-    r = ask(client, "Which product had the highest revenue in the North region?")
-    assert r.status_code == 422
-
-
-# ---------------------------------------------------------------- edge cases
-
-def test_invalid_rows_are_rejected_on_load(client):
-    body = client.get("/api/data-quality").json()
-    rejected = {row[0]: row[1] for row in body["rows"]}
-    assert set(rejected) == {"TXN0034", "TXN0051"}   # quantity 0, missing unit price
-    assert "Quantity" in rejected["TXN0034"]
-    assert "unit price" in rejected["TXN0051"]
-
-
-def test_month_with_no_data_returns_404(client):
-    r = ask(client, "Compare revenue between June and July")
-    assert r.status_code == 404
-    assert "July" in r.json()["detail"]
-
-
-def test_month_extraction():
-    assert extract_months("Compare March 2026 vs apr") == ["2026-03", "2026-04"]
-    assert extract_months("change from 2026-05 to 2026-02") == ["2026-05", "2026-02"]
-    assert detect_intent("May I know the total revenue?") == "total_revenue"
+def test_missing_api_key_returns_503(monkeypatch):
+    # No fake here: the REAL llm module is used, but without a key
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    with TestClient(app) as c:
+        r = ask(c, "What is the total revenue?")
+    assert r.status_code == 503
+    assert "GROQ_API_KEY" in r.json()["detail"]
 
 
 # ---------------------------------------------------------------- SQL safety
+
+def test_destructive_sql_from_llm_is_blocked(client, monkeypatch):
+    monkeypatch.setattr(llm, "generate_sql", lambda q, *a: ("DROP TABLE sales", ""))
+    r = ask(client, "Delete everything please")
+    assert r.status_code == 422
+    assert "blocked" in r.json()["detail"]
+    # data is still there
+    monkeypatch.setattr(llm, "generate_sql", lambda q, *a: (EXAMPLE_SQL["What is the total revenue?"], ""))
+    assert ask(client, "What is the total revenue?").json()["rows"] == [[1439200.0]]
+
 
 @pytest.mark.parametrize("bad_sql", [
     "DROP TABLE sales",
@@ -138,38 +147,58 @@ def test_validator_allows_select():
     assert validate_sql(sql).endswith("GROUP BY region")
 
 
-# ---------------------------------------------------------------- LLM path (fake LLM)
+# ---------------------------------------------------------------- edge cases
 
-def test_llm_generated_sql_is_executed(client, monkeypatch):
-    monkeypatch.setattr(llm, "is_llm_enabled", lambda: True)
-    monkeypatch.setattr(llm, "generate_sql", lambda q: (
-        "SELECT sales_channel, ROUND(SUM(revenue), 2) AS revenue FROM sales "
-        "WHERE status = 'Completed' GROUP BY sales_channel ORDER BY revenue DESC",
-        "Revenue per sales channel.",
-    ))
-    r = ask(client, "Revenue split by sales channel?")
+def test_invalid_csv_rows_are_rejected_on_load(client):
+    body = client.get("/api/data-quality").json()
+    rejected = {row[0]: row[1] for row in body["rows"]}
+    assert set(rejected) == {"TXN0034", "TXN0051"}   # quantity 0, missing unit price
+
+
+def test_returned_orders_excluded_from_revenue(client, monkeypatch):
+    monkeypatch.setattr(llm, "generate_sql", lambda q, *a: (
+        "SELECT COUNT(*) AS n FROM sales WHERE status = 'Completed'", ""))
+    assert ask(client, "How many completed orders?").json()["rows"] == [[48]]  # 49 loaded - 1 returned
+
+
+def test_month_with_no_data_returns_404(client, monkeypatch):
+    monkeypatch.setattr(llm, "generate_sql", lambda q, *a: (
+        "SELECT ROUND(SUM(revenue), 2) AS revenue FROM sales "
+        "WHERE status = 'Completed' AND order_month = '2026-07'", ""))
+    r = ask(client, "What was the revenue in July?")
+    assert r.status_code == 404                      # SUM over no rows = NULL -> no data
+
+
+def test_llm_fixes_its_own_sql_error_on_retry(client, monkeypatch):
+    calls = []
+
+    def fake_generate(q, prev_sql=None, prev_err=None):
+        calls.append(prev_err)
+        if prev_err is None:
+            return "SELECT SUM(revenu) AS total FROM sales", ""      # typo -> SQLite error
+        return "SELECT SUM(revenue) AS total FROM sales WHERE status = 'Completed'", ""
+
+    monkeypatch.setattr(llm, "generate_sql", fake_generate)
+    r = ask(client, "total revenue?")
     assert r.status_code == 200
-    body = r.json()
-    assert body["method"] == "llm"
-    assert {row[0] for row in body["rows"]} == {"Online", "Retail"}
+    assert r.json()["attempts"] == 2
+    assert "no such column" in calls[1]              # the error was sent back to the LLM
 
 
-def test_llm_destructive_sql_is_blocked(client, monkeypatch):
-    monkeypatch.setattr(llm, "is_llm_enabled", lambda: True)
-    monkeypatch.setattr(llm, "generate_sql", lambda q: ("DROP TABLE sales", ""))
-    r = ask(client, "Delete everything please")
-    # Unsafe SQL is never run -> falls back to rules -> rules don't understand -> 422
-    assert r.status_code == 422
-    # Table still exists and data is intact
-    assert ask(client, "What is the total revenue?").json()["rows"][0][0] == 1439200.0
+def test_gives_up_after_two_bad_queries(client, monkeypatch):
+    monkeypatch.setattr(llm, "generate_sql", lambda q, *a: ("SELECT nope FROM sales", ""))
+    assert ask(client, "total revenue?").status_code == 422
 
 
-def test_llm_says_unsupported(client, monkeypatch):
-    monkeypatch.setattr(llm, "is_llm_enabled", lambda: True)
-    monkeypatch.setattr(llm, "generate_sql", lambda q: (None, "Profit is not in the data."))
-    assert ask(client, "What is our profit margin?").status_code == 422
+def test_answer_llm_failure_still_returns_numbers(client, monkeypatch):
+    def broken_answer(*args):
+        raise llm.LLMError("timeout")
+    monkeypatch.setattr(llm, "write_answer", broken_answer)
+    r = ask(client, "What is the total revenue?")
+    assert r.status_code == 200
+    assert r.json()["rows"] == [[1439200.0]]
 
 
-def test_parse_llm_reply_handles_code_fences():
-    sql, _ = llm.parse_llm_reply('```json\n{"sql": "SELECT 1 FROM sales", "explanation": "x"}\n```')
-    assert sql == "SELECT 1 FROM sales"
+def test_parse_json_reply_handles_code_fences():
+    data = llm.parse_json_reply('```json\n{"sql": "SELECT 1 FROM sales", "explanation": "x"}\n```')
+    assert data["sql"] == "SELECT 1 FROM sales"

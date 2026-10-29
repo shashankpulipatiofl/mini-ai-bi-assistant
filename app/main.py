@@ -71,6 +71,9 @@ def ask(request: QuestionRequest):
         raise HTTPException(status_code=422, detail=str(exc))
     except qa_service.NoDataError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except llm.LLMError as exc:
+        logger.error("LLM error: %s", exc)
+        raise HTTPException(status_code=503, detail=f"AI service unavailable: {exc}")
     except sqlite3.Error as exc:
         logger.exception("Database error")
         raise HTTPException(status_code=500, detail=f"Database error: {exc}")
